@@ -1,0 +1,415 @@
+---
+title: "A CLIMBER Meta-Analysis 2024"
+output: html_document
+date: "2024-07-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setting up
+
+```{r, echo=FALSE, message = FALSE}
+# Libraries
+library(metafor)
+library(readxl)
+library(devtools)
+library(meta)
+library(esvis)
+library(dmetar)
+library(tidyverse)
+library(dplyr)
+library(grid)
+library(stringr)
+
+# Number of digits for measures
+settings.meta(digits = 1)
+```
+
+# Importing Datasets
+
+```{r, echo=FALSE, message = FALSE}
+## importing datasets from ODC-SCI (odc-sci.org)
+## download data from odc-sci and place the csvs into the "data" folder
+led_data <- read.csv("data/dataset_1082_1720635210.csv") #literature-extracted data (LED: odc-sci:1082) -- https://dx.doi.org/10.34945/F5DG6D
+iad_data <- read.csv("data/dataset_1081_1720635248.csv") #individual animal data (IAD: odc-sci:1081) -- https://dx.doi.org/10.34945/F5J59P
+```
+
+# Calculations for Individual Animal Data
+
+```{r, echo=FALSE, message = FALSE}
+#calculating the pearson coefficient for IAD
+iad_r_pre_post<-cor(iad_data$controlresult, iad_data$outcomeresult)
+
+#Calculating effect size as standard mean difference for paired samples SMD
+iad_data_agg <- iad_data%>%
+  group_by(grouplabel, PMID)%>%
+  summarise(
+    n.treat = n(),
+    n.control.adj = n.treat,
+    mean_outcomeresult = mean(outcomeresult),
+    mean_controlresult = mean(controlresult),
+    controlresult_SD = sd(controlresult),
+    outcomeresult_SD = sd(outcomeresult),
+    SD_diff = sqrt(controlresult_SD^2+outcomeresult_SD^2-(2*iad_r_pre_post*
+    controlresult_SD*outcomeresult_SD)))%>%# SD difference
+    mutate(SD_diff = ifelse(SD_diff == 0, 0.4, SD_diff), # impute SD_diff 0 for study 16430371, since there is no variance.
+    # SD within for the calculation of the paired SMD
+    SD_within = SD_diff/sqrt(2*(1-iad_r_pre_post)),
+    # paired SMD
+    effect.size = (mean_outcomeresult-mean_controlresult)/SD_within,
+    # Variance of the paired SMD
+    Vd = (1/n.treat+(effect.size^2)/(2*n.treat))*(2*(1-iad_r_pre_post)), ##corrected from r_pre_post
+    # SE of the paired SMD
+    se.effect = sqrt(Vd))
+
+# Add descriptive vars to the aggregate data set
+ iad_data_summary <- iad_data %>%
+      select(PMID, Animal, Strain, Sex_Grouped, Type_of_Injury, Injury_Segment_, Injury_Device, behavioraltest, outcomescore_max, Contusion_severity_group, grouplabel)%>%
+  group_by(PMID, Animal, Strain, Sex_Grouped, Type_of_Injury, Injury_Segment_, Injury_Device, behavioraltest, outcomescore_max, Contusion_severity_group, grouplabel) %>%
+  summarise()
+ 
+iad_data_meta <- left_join(iad_data_summary, iad_data_agg)
+
+## add sample size grouping now that n has been determined
+iad_data_meta <- iad_data_meta %>%
+    mutate( 
+    samplesize = case_when( 
+      between(n.treat, 0, 9) ~ "small (n<10)",
+      between(n.treat, 10, 30) ~ "medium (10<=n<30)",
+      between(n.treat, 30, 100)~ "large (n>30)"))
+
+## removing 11 subjects from IAD where experimental grouping was unable to be determined 
+iad_data_meta  <- iad_data_meta %>%
+  filter(grouplabel != "*unknown*")
+
+## removing group from study because there is only 1 subject
+iad_data_meta  <- iad_data_meta %>%
+  filter(grouplabel != "Study I: Drug")
+
+```
+
+
+### Calculations for Literature-Extracted Data
+
+```{r, echo=FALSE, message = FALSE}
+#Calculating pearson coefficient for LED
+r_pre_post<-cor(led_data$controlresult, led_data$outcomeresult)
+
+## Imputing variation based on the median coefficient of variation (CV)
+## Median control CV
+led_data_CV_control<-led_data%>%
+  filter(control_outcomeerror != 0)%>%
+  group_by(samplesize)%>%
+  mutate(controlresult_SD = ifelse(SD_or_SEM == "SD", control_outcomeerror,
+                                   control_outcomeerror*sqrt(n.control.adj)),
+         controlresult_CV = controlresult_SD/controlresult)%>%
+  filter(!is.infinite(controlresult_CV))%>%
+  summarise(m_control_cv = median(controlresult_CV))
+
+## Median outcome CV       
+led_data_CV_outcome<-led_data%>%
+  group_by(samplesize)%>%
+  filter(outcome_outcomeerror != 0)%>%
+  mutate(outcomeresult_SD = ifelse(SD_or_SEM == "SD", outcome_outcomeerror,
+                                   outcome_outcomeerror*sqrt(n.treat)),
+         outcomeresult_CV = outcomeresult_SD/outcomeresult)%>%
+  filter(!is.infinite(outcomeresult_CV))%>%
+  summarise(m_outcome_cv = median(outcomeresult_CV))
+
+# Imputation of SD and calculation of the SMD as effect size, and SE considering paired samples.
+led_data<-led_data%>%
+  left_join(led_data_CV_control)%>%
+  left_join(led_data_CV_outcome)
+
+led_data<-led_data%>%
+  mutate(
+    ## create control SD var from SD or SEM
+    controlresult_SD = ifelse(SD_or_SEM == "SD", control_outcomeerror,
+                                   control_outcomeerror*sqrt(n.control.adj)),
+    controlresult_SD = ifelse(is.na(SD_or_SEM), 0,controlresult_SD),
+    ## create outcome SD var from SD or SEM
+    outcomeresult_SD = ifelse(SD_or_SEM == "SD", outcome_outcomeerror,
+                                   outcome_outcomeerror*sqrt(n.treat)),
+    outcomeresult_SD = ifelse(is.na(SD_or_SEM), 0,outcomeresult_SD),
+    ## Impute SD from CV
+    controlresult_SD = ifelse(controlresult_SD == 0,
+                                   controlresult*m_control_cv,controlresult_SD),
+    outcomeresult_SD = ifelse(outcomeresult_SD == 0,
+                                   outcomeresult*m_outcome_cv,outcomeresult_SD),
+    SD_diff = sqrt(controlresult_SD^2+outcomeresult_SD^2-(2*r_pre_post*
+    controlresult_SD*outcomeresult_SD)), ## SD difference
+    #SD within
+    SD_within = SD_diff/sqrt(2*(1-r_pre_post)),
+    effect.size = (outcomeresult-controlresult)/SD_within,
+    Vd = (1/n.treat+(effect.size^2)/(2*n.treat))*(2*(1-r_pre_post)),
+    se.effect = sqrt(Vd)) ## SD within
+
+```
+
+
+
+
+```{r, echo=FALSE, message = FALSE}
+## sorting for graphs
+iad_data_meta <- iad_data_meta %>%
+  arrange(PMID, grouplabel) %>%
+  mutate(Contusion_severity_group = factor(Contusion_severity_group, levels = c("mild", "moderate", "severe")))
+
+led_data<- led_data %>%
+  arrange(PMID, grouplabel) %>%
+  mutate(Contusion_severity_group = factor(Contusion_severity_group, levels = c("mild", "moderate", "severe")))
+
+```
+
+## Literature-Extracted Data Meta-analysis
+
+```{r, echo=FALSE, message = FALSE}
+############## meta-analysis for LED
+led_m2<- metagen(effect.size, se.effect, data = led_data, sm = "SMD",
+             n.e = n.treat,
+             n.c = n.control.adj,
+             studlab = grouplabel, method.tau = "REML", hakn = TRUE)
+
+##subgroups
+led_m2.pmid<- update(led_m2, byvar = PMID, tau.common = TRUE, bylab="Study PMID", order=order(led_m2$data$PMID))
+led_m2.animal <- update(led_m2, byvar = Animal, tau.common = TRUE, bylab="Animal Type", order=order(led_m2$data$Animal))
+led_m2.strain <- update(led_m2, byvar = Strain, tau.common = TRUE, bylab = "Animal Strain")
+led_m2.sex <- update(led_m2, byvar = Sex_Grouped, tau.common = TRUE, bylab = "Animal Sex")
+led_m2.levelinjury <- update(led_m2, byvar = Injury_Segment, tau.common = TRUE,bylab = "Level of injury") 
+led_m2.severityinjury <- update(led_m2, byvar = Contusion_severity_group, tau.common = TRUE,bylab = "Injury severity") 
+led_m2.samplesize <- update(led_m2, byvar = samplesize, tau.common = TRUE,bylab = "Sample Size") 
+
+```
+
+## Individual Animal Data Meta-analysis
+
+```{r, echo=FALSE, message = FALSE}
+############## meta-analysis for IAD
+iad_m2<- metagen(effect.size, se.effect, data = iad_data_meta, sm = "SMD",
+             n.e = n.treat,
+             n.c = n.control.adj,
+             studlab = grouplabel, method.tau = "REML", hakn = TRUE)      
+
+##subgroups
+iad_m2.pmid <- update(iad_m2, byvar = PMID, tau.common = TRUE, bylab="Study PMID", order=order(iad_m2$data$PMID))
+iad_m2.animal <- update(iad_m2, byvar = Animal, tau.common = TRUE, bylab="Animal Type", order=order(iad_m2$data$Animal))
+iad_m2.strain <- update(iad_m2, byvar = Strain, tau.common = TRUE, bylab = "Animal Strain")
+iad_m2.sex <- update(iad_m2, byvar = Sex_Grouped, tau.common = TRUE, bylab = "Animal Sex")
+iad_m2.levelinjury <- update(iad_m2, byvar = Injury_Segment_, tau.common = TRUE,bylab = "Level of injury")
+iad_m2.severityinjury <- update(iad_m2, byvar = Contusion_severity_group, tau.common = TRUE,bylab = "Injury severity") 
+iad_m2.samplesize <- update(iad_m2, byvar = samplesize, tau.common = TRUE,bylab = "Sample Size") 
+
+```
+
+
+```{r, echo=FALSE, message = FALSE}
+## led data
+mb3 <- metabind(led_m2.pmid)
+mb4 <- metabind(led_m2.animal)
+mb5 <- metabind(led_m2.animal, led_m2.sex, led_m2.strain)
+mb6 <- metabind(led_m2.levelinjury, led_m2.samplesize)
+mb7 <- metabind(led_m2.animal, led_m2.sex, led_m2.strain, led_m2.levelinjury, led_m2.samplesize, led_m2.severityinjury)
+
+## iad data
+mb14 <- metabind(iad_m2.pmid)
+mb15 <- metabind(iad_m2.animal)
+mb16 <- metabind(iad_m2.animal, iad_m2.sex, iad_m2.strain)
+mb17 <- metabind(iad_m2.levelinjury, iad_m2.samplesize)
+mb17.1 <- metabind(iad_m2.animal, iad_m2.sex, iad_m2.strain, iad_m2.levelinjury, iad_m2.samplesize,iad_m2.severityinjury)
+
+## led & iad subgroup data
+mb18 <- metabind(led_m2.animal, iad_m2.animal, name = c("Literature-Extracted Data", "Individual Animal Data"))
+mb19 <- metabind(led_m2.strain, iad_m2.strain, name = c("Literature-Extracted Data", "Individual Animal Data"))
+mb20 <- metabind(led_m2.sex, iad_m2.sex, name = c("Literature-Extracted Data", "Individual Animal Data"))
+mb21 <- metabind(led_m2.severityinjury, iad_m2.severityinjury, name = c("Literature-Extracted Data", "Individual Animal Data"))
+mb24 <- metabind(led_m2.levelinjury, iad_m2.levelinjury, name = c("Literature-Extracted Data", "Individual Animal Data"))
+mb25 <- metabind(led_m2.samplesize, iad_m2.samplesize, name = c("Literature-Extracted Data", "Individual Animal Data"))
+```
+
+## Literature-Extracted Data Meta-Analysis Summary
+
+```{r, echo=FALSE, fig.width = 9, fig.height = 10}
+
+tiff("metagraphs_final_2024/led_summary.tiff", width = 8.5, height = 7.6, units = "in", res = 600)
+
+forest_obj<-forest(mb3,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#ED6C6C",
+       xlim = c(-20, 20),
+       digits.addcols = 0,
+       subgroup = FALSE,
+       test.subgroup = FALSE,
+       resid.hetstat = FALSE,
+       just = "center",
+       leftcols = c("studlab", "n.e"),
+       leftlabs = c("Experimental Groups", "Sample Size"),
+       addrow.subgroups = FALSE,
+       common = FALSE,
+       addrows.below.overall = 1)
+
+grid.text("Random Effects Model: Literature-Extracted Data", y = unit(0.98, "npc"), gp = gpar(fontfamily = "Arial", fontsize = 13))
+
+dev.off()
+
+```
+
+## Literature-Extracted Data Subgroups
+```{r, echo=FALSE, fig.width = 9.5, fig.height = 6.5}
+tiff("metagraphs_final_2024/led_subgroups.tiff", width = 8.5, height = 7, units = "in", res = 600)
+
+forest(mb7,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#F1ACAC",
+       xlim = c(-15, 15),
+       digits.addcols = 0,
+       colgap.forest.right = ".5cm",
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+
+grid.text("Literature-Extracted Data Subgroups", y = unit(0.98, "npc"), gp = gpar(fontfamily = "Arial", fontsize = 13))
+
+dev.off()
+
+```
+
+
+
+
+## Individual Animal Data Meta-Analysis Summary
+```{r, echo=FALSE, fig.width = 10, fig.height = 8.2}
+
+tiff("metagraphs_final_2024/iad_summary.tiff", width = 8.5, height = 7.6, units = "in", res = 600)
+
+forest(mb14,
+       lower.equi = iad_m2$lower.random, upper.equi = iad_m2$upper.random,
+       fill.equi = "#FFD773",
+       xlim = c(-20, 20),
+       digits.addcols = 0,
+       subgroup = FALSE,
+       test.subgroup = FALSE,
+       resid.hetstat = FALSE,
+       colgap.left = "5mm",
+       just = "center",
+       leftcols = c("studlab", "n.e"),
+       leftlabs = c("Experimental Groups", "Sample Size"),
+       addrow.subgroups = FALSE,
+       common = FALSE,
+       addrows.below.overall = 1)
+
+grid.text("Random Effects Model: Individual Animal Data", y = unit(0.98, "npc"), gp = gpar(fontfamily = "Arial", fontsize = 13))
+
+dev.off()
+```
+
+## Individual Animal Data Subgroups
+```{r, echo=FALSE, fig.width = 9, fig.height = 7}
+tiff("metagraphs_final_2024/iad_subgroups.tiff", width = 8.5, height = 7, units = "in", res = 600)
+
+forest(mb17.1,
+       lower.equi = iad_m2$lower.random, upper.equi = iad_m2$upper.random,
+       fill.equi = "#FFF88F",
+       xlim = c(-15, 15),
+       digits.addcols = 0,
+       colgap.left = ".1mm",
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+
+grid.text("Individual Animal Data Subgroups", y = unit(0.98, "npc"), gp = gpar(fontfamily = "Arial", fontsize = 13))
+
+dev.off()
+```
+
+## Sex Published & Individual Animal Data
+```{r, echo=FALSE, fig.width = 8, fig.height = 2.7}
+tiff("metagraphs_final_2024/animal_sex.tiff", width = 8, height = 2.8, units = "in", res = 600)
+forest(mb20,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#6A85A7",
+       digits.addcols = 0,
+       colgap.left = ".4cm",
+       colgap.forest.right = ".5cm",
+       xlim = c(-15, 15),
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+dev.off()
+
+```
+
+## Animal Type Literature-Extracted Data & Individual Animal Data
+```{r, echo=FALSE, fig.width = 8, fig.height = 2.7}
+tiff("metagraphs_final_2024/animal_type.tiff", width = 8, height = 2.8, units = "in", res = 600)
+forest(mb18,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#64C1D5",
+       digits.addcols = 0,
+       colgap.left = ".4cm",
+       colgap.forest.right = ".5cm",
+       xlim = c(-15, 15),
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+dev.off()
+```
+
+## Animal Strain Literature-Extracted Data & Individual Animal Data
+```{r, echo=FALSE, fig.width = 8, fig.height = 3}
+tiff("metagraphs_final_2024/animal_strain.tiff", width = 8.2, height = 3, units = "in", res = 600)
+forest(mb19,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#20AE9F",
+       digits.addcols = 0,
+       colgap.forest.right = ".5cm",
+       xlim = c(-15, 15),
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+dev.off()
+
+```
+
+
+## Injury Level Literature-Extracted Data & Individual Animal Data
+```{r, echo=FALSE, fig.width = 7.8, fig.height = 3}
+tiff("metagraphs_final_2024/injury_level.tiff", width = 7.8, height = 3.2, units = "in", res = 600)
+forest(mb24,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#47C599",
+       xlim = c(-15, 15),
+       digits.addcols = 0,
+       colgap.left = ".4cm",
+       colgap.forest.right = ".5cm",
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+dev.off()
+
+```
+
+## Sample Size Literature-Extracted Data & Individual Animal Data
+
+```{r, echo=FALSE, fig.width = 8.5, fig.height = 3}
+tiff("metagraphs_final_2024/samplesize.tiff", width = 8.5, height = 3.1, units = "in", res = 600)
+forest(mb25,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#B9F0FC",
+       xlim = c(-15, 15),
+       digits.addcols = 0,
+       colgap.forest.right = ".5cm",
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+dev.off()
+```
+
+
+## Injury severity Literature-Extracted Data & Individual Animal Data
+```{r, echo=FALSE, fig.width = 8.5, fig.height = 3}
+tiff("metagraphs_final_2024/injury_severity.tiff", width = 8.2, height = 3.1, units = "in", res = 600)
+forest(mb21,
+       lower.equi = led_m2$lower.random, upper.equi = led_m2$upper.random,
+       fill.equi = "#B6B3FF",
+       xlim = c(-15, 15),
+       digits.addcols = 0,
+       colgap.forest.right = ".5cm",
+       colgap.left = ".5cm",
+       leftlabs = c("Variables", "Number of \nExperimental Groups", "Interaction \nP-value"))
+dev.off()
+
+default_parameters <- par()
+default_parameters$family
+
+
+
+```
+
